@@ -22,12 +22,12 @@ jobs:
             os: ubuntu-latest
             preset_args: -DCMAKE_BUILD_TYPE=Release
             binary: build/shelf_solver
-            archive: shelf_solver-linux-x64.tar.gz
+            asset: shelf_solver-linux-x64
           - name: windows-x64
             os: windows-latest
             preset_args: -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
             binary: build/Release/shelf_solver.exe
-            archive: shelf_solver-windows-x64.zip
+            asset: shelf_solver-windows-x64.exe
 
     steps:
       - name: Checkout
@@ -50,29 +50,26 @@ jobs:
         run: |
           "${{ matrix.binary }}" 1 1 n8 smoke.svg
 
-      - name: Package Linux
+      - name: Prepare Linux binary
         if: runner.os == 'Linux'
         shell: bash
         run: |
-          mkdir -p dist/shelf_solver-linux-x64
-          cp "${{ matrix.binary }}" dist/shelf_solver-linux-x64/
-          cp README.md BUILD.md dist/shelf_solver-linux-x64/
-          tar -czf "dist/${{ matrix.archive }}" -C dist shelf_solver-linux-x64
+          mkdir -p dist
+          cp "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+          chmod +x "dist/${{ matrix.asset }}"
 
-      - name: Package Windows
+      - name: Prepare Windows binary
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force dist/shelf_solver-windows-x64 | Out-Null
-          Copy-Item "${{ matrix.binary }}" dist/shelf_solver-windows-x64/
-          Copy-Item README.md, BUILD.md dist/shelf_solver-windows-x64/
-          Compress-Archive -Path dist/shelf_solver-windows-x64 -DestinationPath "dist/${{ matrix.archive }}" -Force
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: dist/${{ matrix.archive }}
+          path: dist/${{ matrix.asset }}
           if-no-files-found: error
 
   release:
