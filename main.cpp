@@ -462,17 +462,6 @@ namespace {
             } else { lx += 200; }
         }
 
-        if (std::string(nb) == "n1" || std::string(nb) == "n2") {
-            if (col % 4 != 0) lrow += 22;
-            const double ay = lrow + 7;
-            svg << "  <line x1=\"" << num(pad) << "\" y1=\"" << num(ay) << "\" x2=\""
-                    << num(pad + 14) << "\" y2=\"" << num(ay)
-                    << "\" stroke=\"#16400f\" stroke-width=\"1.7\" marker-end=\"url(#arrow)\"/>\n";
-            svg << "  <text x=\"" << num(pad + 20) << "\" y=\"" << num(lrow + 11)
-                    << "\" font-size=\"12\">arrow = shelf front facing"
-                    << (two_cell ? " (long face)" : " (best rotation)") << "</text>\n";
-        }
-
         svg << "</svg>\n";
 
         std::ofstream out(out_path);
