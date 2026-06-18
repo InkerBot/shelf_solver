@@ -1,0 +1,104 @@
+name: Nightly
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64
+            os: ubuntu-latest
+            preset_args: -DCMAKE_BUILD_TYPE=Release
+            binary: build/shelf_solver
+            archive: shelf_solver-linux-x64.tar.gz
+          - name: windows-x64
+            os: windows-latest
+            preset_args: -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+            binary: build/Release/shelf_solver.exe
+            archive: shelf_solver-windows-x64.zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure
+        shell: bash
+        run: >
+          cmake -S . -B build
+          ${{ matrix.preset_args }}
+          -DSHELF_USE_BUNDLED_JSON=ON
+          -DSHELF_STATIC_MSVC_RUNTIME=ON
+          -DSHELF_NATIVE_OPTIMIZATIONS=OFF
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Smoke test
+        shell: bash
+        run: |
+          "${{ matrix.binary }}" 1 1 n8 smoke.svg
+
+      - name: Package Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p dist/shelf_solver-linux-x64
+          cp "${{ matrix.binary }}" dist/shelf_solver-linux-x64/
+          cp README.md BUILD.md dist/shelf_solver-linux-x64/
+          tar -czf "dist/${{ matrix.archive }}" -C dist shelf_solver-linux-x64
+
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist/shelf_solver-windows-x64 | Out-Null
+          Copy-Item "${{ matrix.binary }}" dist/shelf_solver-windows-x64/
+          Copy-Item README.md, BUILD.md dist/shelf_solver-windows-x64/
+          Compress-Archive -Path dist/shelf_solver-windows-x64 -DestinationPath "dist/${{ matrix.archive }}" -Force
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/${{ matrix.archive }}
+          if-no-files-found: error
+
+  release:
+    name: Publish nightly release
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Recreate nightly release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release delete nightly --yes --cleanup-tag || true
+          git push origin :refs/tags/nightly || true
+          gh release create nightly dist/* \
+            --title "Nightly" \
+            --notes "Automated nightly build from ${GITHUB_SHA}." \
+            --target "${GITHUB_SHA}" \
+            --latest=false

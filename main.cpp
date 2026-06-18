@@ -4,7 +4,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -13,11 +12,13 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
 #include <nlohmann/json.hpp>
 
+#include "embedded_maps.hpp"
 #include "shelf_solver.hpp"
 
 namespace {
@@ -39,6 +40,11 @@ namespace {
         Cell real_exit{-1, -1}; // config 302 inner: the exit door (made solid)
         Cell cashier_access{-1, -1}; // config 303: the path's goal (solver T)
         std::vector<Cell> counter; // the real 2-cell cashier counter (solid)
+    };
+
+    struct CashierMap {
+        CashierModel model;
+        std::string json;
     };
 
     Cell innerCell(const nlohmann::json &p) {
@@ -74,11 +80,13 @@ namespace {
         }
     }
 
-    std::optional<CashierModel> buildCashierMap(const std::string &src, const std::string &dst) {
-        std::ifstream in(src);
-        if (!in) return std::nullopt;
+    std::optional<CashierMap> buildCashierMap(std::string_view src) {
         nlohmann::json j;
-        try { in >> j; } catch (...) { return std::nullopt; }
+        try {
+            j = nlohmann::json::parse(src.begin(), src.end());
+        } catch (...) {
+            return std::nullopt;
+        }
         if (!j.contains("data")) return std::nullopt;
 
         CashierModel m;
@@ -128,10 +136,22 @@ namespace {
             e["CommandList"] = std::move(kept);
         }
 
-        std::ofstream out(dst);
-        if (!out) return std::nullopt;
-        out << j.dump();
-        return out ? std::optional<CashierModel>(m) : std::nullopt;
+        return CashierMap{std::move(m), j.dump()};
+    }
+
+    std::optional<std::string> readTextFile(const std::string &path) {
+        std::ifstream in(path);
+        if (!in) return std::nullopt;
+        std::ostringstream out;
+        out << in.rdbuf();
+        return out.str();
+    }
+
+    std::string mapFilePath(const std::string &maps_dir, int map_index) {
+        const std::string scene_path = maps_dir + "/" + std::to_string(map_index) + "/buildConstData.json";
+        std::ifstream scene(scene_path);
+        if (scene) return scene_path;
+        return maps_dir + "/m" + std::to_string(map_index) + ".json";
     }
 
     struct CellGrid {
@@ -370,7 +390,7 @@ namespace {
 
     bool writeSolutionSvg(const std::string &out_path, const shelf::SolveResult &res,
                           int map_index, int level, const char *nb, bool two_cell,
-                          const std::optional<CashierModel> &model) {
+                          const CashierModel *model) {
         CellGrid g;
         if (!parseRender(res.render, g)) return false;
 
@@ -513,11 +533,25 @@ int main(int argc, char **argv) {
     std::cout << "Solving map " << map_index << " at level " << level
             << " (coverage: " << cov_label << ", maps dir: " << opt.maps_dir << ")...\n";
 
-    const std::string src_path = opt.maps_dir + "/" + std::to_string(map_index) + "/buildConstData.json";
-    namespace fs = std::filesystem;
-    const fs::path tmp_path =
-            fs::temp_directory_path() / ("shelf_solver_m" + std::to_string(map_index) + ".tmp.json");
-    const std::optional<CashierModel> model = buildCashierMap(src_path, tmp_path.string());
+    std::string map_json;
+    if (opt.maps_dir == "Scene") {
+        const std::string_view embedded = shelf::embeddedMapJson(map_index);
+        if (embedded.empty()) {
+            std::cerr << "ERROR: embedded map " << map_index << " was not found\n";
+            return 1;
+        }
+        map_json.assign(embedded.begin(), embedded.end());
+    } else {
+        const std::string src_path = mapFilePath(opt.maps_dir, map_index);
+        std::optional<std::string> external = readTextFile(src_path);
+        if (!external) {
+            std::cerr << "ERROR: cannot open map file: " << src_path << "\n";
+            return 1;
+        }
+        map_json = std::move(*external);
+    }
+    const std::optional<CashierMap> cashier_map = buildCashierMap(map_json);
+    const CashierModel *model = cashier_map ? &cashier_map->model : nullptr;
 
     const auto t0 = std::chrono::steady_clock::now();
 
@@ -533,14 +567,11 @@ int main(int argc, char **argv) {
                 << secs << "s   " << std::flush;
     };
 
-    shelf::SolveResult res = model
-                                 ? shelf::solveMapFile(tmp_path.string(), level, opt)
-                                 : shelf::solveMap(map_index, level, opt);
+    shelf::SolveResult res = cashier_map
+                                 ? shelf::solveMapJson(cashier_map->json, level, opt)
+                                 : shelf::solveMapJson(map_json, level, opt);
     const std::chrono::duration<double> dt = std::chrono::steady_clock::now() - t0;
     std::cerr << "\n"; // finish the progress line
-
-    std::error_code ec;
-    fs::remove(tmp_path, ec);
 
     if (!res.ok) {
         std::cerr << "ERROR: " << res.error << "\n";

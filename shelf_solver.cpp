@@ -1,5 +1,7 @@
 #include "shelf_solver.hpp"
 
+#include "embedded_maps.hpp"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -13,6 +15,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -427,19 +430,25 @@ namespace shelf {
             int max_level = 0;
         };
 
-        std::optional<MapModel> loadMap(const std::string &path, int level, std::string &err) {
-            std::ifstream in(path);
-            if (!in) {
-                err = "cannot open map file: " + path;
-                return std::nullopt;
-            }
-            nlohmann::json j;
-            try {
-                in >> j;
-            } catch (const std::exception &e) {
-                err = std::string("JSON parse error: ") + e.what();
-                return std::nullopt;
-            }
+        std::vector<Cell> regionCells(const nlohmann::json &p) {
+            std::vector<Cell> cells;
+            if (p.size() < 2) return cells;
+            const int x = p[0].get<int>();
+            const int y = p[1].get<int>();
+#ifdef SHELF_RECT_REGIONS
+            const int w = p.size() >= 4 ? p[2].get<int>() : 1;
+            const int h = p.size() >= 4 ? p[3].get<int>() : 1;
+#else
+            const int w = 1, h = 1;
+#endif
+            cells.reserve(static_cast<std::size_t>(std::max(0, w)) * std::max(0, h));
+            for (int dy = 0; dy < h; ++dy)
+                for (int dx = 0; dx < w; ++dx)
+                    cells.emplace_back(x + dx, y + dy);
+            return cells;
+        }
+
+        std::optional<MapModel> parseMapJson(const nlohmann::json &j, int level, std::string &err) {
 
             MapModel m;
             if (j.contains("highPlatformArr")) {
@@ -463,7 +472,10 @@ namespace shelf {
                     const auto &p = cmd["Params"];
                     switch (type) {
                         case 101: // floor tile
-                            m.floor.emplace(p[0].get<int>(), p[1].get<int>());
+                            for (const Cell &cell: regionCells(p)) m.floor.insert(cell);
+                            break;
+                        case 201: // high platform region
+                            for (const Cell &cell: regionCells(p)) m.high_platform.insert(cell);
                             break;
                         case 301: // entrance -> inner cell
                             m.entrance = (p.size() >= 4)
@@ -481,6 +493,40 @@ namespace shelf {
                 }
             }
             return m;
+        }
+
+        std::optional<MapModel> loadMapJson(std::string_view text, int level, std::string &err) {
+            nlohmann::json j;
+            try {
+                j = nlohmann::json::parse(text.begin(), text.end());
+            } catch (const std::exception &e) {
+                err = std::string("JSON parse error: ") + e.what();
+                return std::nullopt;
+            }
+            return parseMapJson(j, level, err);
+        }
+
+        std::optional<MapModel> loadMapFile(const std::string &path, int level, std::string &err) {
+            std::ifstream in(path);
+            if (!in) {
+                err = "cannot open map file: " + path;
+                return std::nullopt;
+            }
+            nlohmann::json j;
+            try {
+                in >> j;
+            } catch (const std::exception &e) {
+                err = std::string("JSON parse error: ") + e.what();
+                return std::nullopt;
+            }
+            return parseMapJson(j, level, err);
+        }
+
+        std::string mapFilePath(const std::string &maps_dir, int map_index) {
+            const std::string scene_path = maps_dir + "/" + std::to_string(map_index) + "/buildConstData.json";
+            std::ifstream scene(scene_path);
+            if (scene) return scene_path;
+            return maps_dir + "/m" + std::to_string(map_index) + ".json";
         }
 
         std::string renderSolution(const Instance &I, const Solution &sol, int ox, int oy) {
@@ -593,173 +639,198 @@ namespace shelf {
                     << "   origin (map coords) = (" << ox << ", " << oy << ")\n";
             return os.str();
         }
+
+        SolveResult solveMapModel(const MapModel &m, int level, const SolveOptions &opt) {
+            SolveResult R;
+            R.level = level;
+
+            if (m.entrance.first < 0 || m.exit.first < 0) {
+                R.error = "map is missing an entrance (301) or exit (302)";
+                return R;
+            }
+
+            std::set<Cell> walk = m.floor;
+            if (opt.exclude_high_platform) {
+                for (const auto &c: m.high_platform) walk.erase(c);
+            }
+            walk.insert(m.entrance);
+            walk.insert(m.exit);
+
+            if (walk.size() < 2) {
+                R.error = "not enough walkable tiles at level " + std::to_string(level);
+                return R;
+            }
+
+            int minx = INT32_MAX, miny = INT32_MAX, maxx = INT32_MIN, maxy = INT32_MIN;
+            for (const auto &[x, y]: walk) {
+                minx = std::min(minx, x);
+                miny = std::min(miny, y);
+                maxx = std::max(maxx, x);
+                maxy = std::max(maxy, y);
+            }
+            const int ox = minx, oy = miny;
+            const int W = maxx - minx + 1, H = maxy - miny + 1;
+
+            std::vector<std::string> grid(H, std::string(W, '#'));
+            for (const auto &[x, y]: walk) grid[y - oy][x - ox] = '.';
+            grid[m.entrance.second - oy][m.entrance.first - ox] = 'S';
+            grid[m.exit.second - oy][m.exit.first - ox] = 'T';
+
+            auto inst = buildInstance(grid, opt.neighborhood, ORDER_NESW, opt.two_cell);
+            if (!inst) {
+                R.error = "internal: failed to place S/T on grid";
+                return R;
+            }
+            const Instance &I = *inst;
+
+            R.ok = true;
+            R.walkable = static_cast<int>(I.freeCells.size());
+            R.flippable = static_cast<int>(I.vars.size());
+            R.entrance = m.entrance;
+            R.exit = m.exit;
+
+            if (!bfsPath(I, I.isFree)) {
+                R.feasible = false;
+                R.render = renderSolution(I, Solution{corridorShelf(I, {}), {}}, ox, oy);
+                return R;
+            }
+
+            const std::uint64_t iters =
+                    opt.iters_base + opt.iters_per_cell * static_cast<std::uint64_t>(I.freeCells.size());
+            const int restarts = std::max(1, opt.restarts);
+
+            std::atomic<std::uint64_t> done{0};
+            std::atomic<int> bestAtomic{-1};
+            const std::uint64_t total = iters * static_cast<std::uint64_t>(restarts);
+            std::atomic<std::uint64_t> *pDone = opt.on_progress ? &done : nullptr;
+            std::atomic<int> *pBest = opt.on_progress ? &bestAtomic : nullptr;
+
+            std::vector<OptResult> results(restarts);
+            auto runRestart = [&](int r) {
+                std::mt19937 rng(opt.seed + static_cast<std::uint32_t>(r) * 0x9E3779B9u);
+                std::optional<std::vector<int> > init =
+                        (r == 0) ? bfsPath(I, I.isFree) : randDFS(I, I.s, I.t, I.isFree, rng);
+                if (!init) {
+                    results[r].sol.eval.coverage = -1;
+                    if (pDone) pDone->fetch_add(iters, std::memory_order_relaxed); // keep `total` honest
+                    return;
+                }
+                results[r] = solvePathSA(I, *init, iters, opt.t0, opt.t_min, rng, pDone, pBest);
+            };
+
+            std::atomic<bool> monitoring{static_cast<bool>(opt.on_progress)};
+            std::thread monitor;
+            if (opt.on_progress) {
+                monitor = std::thread([&] {
+                    while (monitoring.load(std::memory_order_relaxed)) {
+                        SolveProgress p;
+                        p.fraction = total
+                                             ? std::min(1.0,
+                                                        static_cast<double>(done.load(std::memory_order_relaxed)) /
+                                                                static_cast<double>(total))
+                                             : 0.0;
+                        p.best = bestAtomic.load(std::memory_order_relaxed);
+                        opt.on_progress(p);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                });
+            }
+
+            unsigned hw = opt.threads ? opt.threads : std::thread::hardware_concurrency();
+            unsigned nworkers = std::max(1u, std::min<unsigned>(hw ? hw : 1u, static_cast<unsigned>(restarts)));
+            if (nworkers == 1) {
+                for (int r = 0; r < restarts; ++r) runRestart(r);
+            } else {
+                std::atomic<int> next{0};
+                std::vector<std::thread> pool;
+                pool.reserve(nworkers);
+                for (unsigned w = 0; w < nworkers; ++w) {
+                    pool.emplace_back([&] {
+                        for (int r = next.fetch_add(1); r < restarts; r = next.fetch_add(1)) runRestart(r);
+                    });
+                }
+                for (auto &th: pool) th.join();
+            }
+
+            if (monitor.joinable()) {
+                monitoring.store(false, std::memory_order_relaxed);
+                monitor.join();
+            }
+            if (opt.on_progress) opt.on_progress(SolveProgress{1.0, bestAtomic.load(std::memory_order_relaxed)});
+
+            OptResult best;
+            best.sol.eval.coverage = -1;
+            for (auto &res: results) {
+                if (res.sol.eval.coverage > best.sol.eval.coverage) best = std::move(res);
+            }
+            if (best.sol.eval.coverage < 0) {
+                R.feasible = false;
+                return R;
+            }
+
+            R.feasible = best.sol.eval.feasible;
+            R.coverage = best.sol.eval.coverage;
+            R.path_length = static_cast<int>(best.sol.eval.path.size());
+            for (int c: best.sol.eval.path) R.path.emplace_back(I.cx(c) + ox, I.cy(c) + oy);
+            std::vector<std::uint8_t> onP(I.W * I.H, 0);
+            for (int pc: best.sol.eval.path) onP[pc] = 1;
+            if (I.two_cell) {
+                Tiling t = tile2cell(I, best.sol.shelf, onP);
+                auto mc = [&](int c) { return std::pair<int, int>{I.cx(c) + ox, I.cy(c) + oy}; };
+                for (const Domino &d: t.dominoes) {
+                    std::array<std::pair<int, int>, 2> cells{mc(d.a), mc(d.b)};
+                    R.dominoes.push_back(cells);
+                    if (d.score > 0) {
+                        R.counted_shelves.push_back(cells[0]);
+                        R.counted_shelves.push_back(cells[1]);
+                    }
+                }
+                for (int c: t.roadblocks) R.roadblocks.push_back(mc(c));
+            } else {
+                for (int c: I.freeCells) {
+                    if (!best.sol.shelf[c]) continue;
+                    int x = I.cx(c), y = I.cy(c);
+                    if (shelfBest(I, onP, x, y).faces > 0) R.counted_shelves.emplace_back(x + ox, y + oy);
+                }
+            }
+            R.render = renderSolution(I, best.sol, ox, oy);
+            return R;
+        }
     } // namespace
+
+    SolveResult solveMapJson(std::string_view map_json, int level, const SolveOptions &opt) {
+        SolveResult R;
+        R.level = level;
+
+        std::string err;
+        auto mm = loadMapJson(map_json, level, err);
+        if (!mm) {
+            R.error = err;
+            return R;
+        }
+        return solveMapModel(*mm, level, opt);
+    }
 
     SolveResult solveMapFile(const std::string &map_path, int level, const SolveOptions &opt) {
         SolveResult R;
         R.level = level;
 
         std::string err;
-        auto mm = loadMap(map_path, level, err);
+        auto mm = loadMapFile(map_path, level, err);
         if (!mm) {
             R.error = err;
             return R;
         }
-        if (mm->entrance.first < 0 || mm->exit.first < 0) {
-            R.error = "map is missing an entrance (301) or exit (302)";
-            return R;
-        }
-
-        std::set<Cell> walk = mm->floor;
-        if (opt.exclude_high_platform) {
-            for (const auto &c: mm->high_platform) walk.erase(c);
-        }
-        walk.insert(mm->entrance);
-        walk.insert(mm->exit);
-
-        if (walk.size() < 2) {
-            R.error = "not enough walkable tiles at level " + std::to_string(level);
-            return R;
-        }
-
-        int minx = INT32_MAX, miny = INT32_MAX, maxx = INT32_MIN, maxy = INT32_MIN;
-        for (const auto &[x, y]: walk) {
-            minx = std::min(minx, x);
-            miny = std::min(miny, y);
-            maxx = std::max(maxx, x);
-            maxy = std::max(maxy, y);
-        }
-        const int ox = minx, oy = miny;
-        const int W = maxx - minx + 1, H = maxy - miny + 1;
-
-        std::vector<std::string> grid(H, std::string(W, '#'));
-        for (const auto &[x, y]: walk) grid[y - oy][x - ox] = '.';
-        grid[mm->entrance.second - oy][mm->entrance.first - ox] = 'S';
-        grid[mm->exit.second - oy][mm->exit.first - ox] = 'T';
-
-        auto inst = buildInstance(grid, opt.neighborhood, ORDER_NESW, opt.two_cell);
-        if (!inst) {
-            R.error = "internal: failed to place S/T on grid";
-            return R;
-        }
-        const Instance &I = *inst;
-
-        R.ok = true;
-        R.walkable = static_cast<int>(I.freeCells.size());
-        R.flippable = static_cast<int>(I.vars.size());
-        R.entrance = mm->entrance;
-        R.exit = mm->exit;
-
-        if (!bfsPath(I, I.isFree)) {
-            R.feasible = false;
-            R.render = renderSolution(I, Solution{corridorShelf(I, {}), {}}, ox, oy);
-            return R;
-        }
-
-        const std::uint64_t iters = opt.iters_base + opt.iters_per_cell * static_cast<std::uint64_t>(I.freeCells.
-                                        size());
-
-        const int restarts = std::max(1, opt.restarts);
-
-        std::atomic<std::uint64_t> done{0};
-        std::atomic<int> bestAtomic{-1};
-        const std::uint64_t total = iters * static_cast<std::uint64_t>(restarts);
-        std::atomic<std::uint64_t> *pDone = opt.on_progress ? &done : nullptr;
-        std::atomic<int> *pBest = opt.on_progress ? &bestAtomic : nullptr;
-
-        std::vector<OptResult> results(restarts);
-        auto runRestart = [&](int r) {
-            std::mt19937 rng(opt.seed + static_cast<std::uint32_t>(r) * 0x9E3779B9u);
-            std::optional<std::vector<int> > init =
-                    (r == 0) ? bfsPath(I, I.isFree) : randDFS(I, I.s, I.t, I.isFree, rng);
-            if (!init) {
-                results[r].sol.eval.coverage = -1;
-                if (pDone) pDone->fetch_add(iters, std::memory_order_relaxed); // keep `total` honest
-                return;
-            }
-            results[r] = solvePathSA(I, *init, iters, opt.t0, opt.t_min, rng, pDone, pBest);
-        };
-
-        std::atomic<bool> monitoring{static_cast<bool>(opt.on_progress)};
-        std::thread monitor;
-        if (opt.on_progress) {
-            monitor = std::thread([&] {
-                while (monitoring.load(std::memory_order_relaxed)) {
-                    SolveProgress p;
-                    p.fraction = total
-                                     ? std::min(1.0, static_cast<double>(done.load(std::memory_order_relaxed)) /
-                                                     static_cast<double>(total))
-                                     : 0.0;
-                    p.best = bestAtomic.load(std::memory_order_relaxed);
-                    opt.on_progress(p);
-                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                }
-            });
-        }
-
-        unsigned hw = opt.threads ? opt.threads : std::thread::hardware_concurrency();
-        unsigned nworkers = std::max(1u, std::min<unsigned>(hw ? hw : 1u, static_cast<unsigned>(restarts)));
-        if (nworkers == 1) {
-            for (int r = 0; r < restarts; ++r) runRestart(r);
-        } else {
-            std::atomic<int> next{0};
-            std::vector<std::thread> pool;
-            pool.reserve(nworkers);
-            for (unsigned w = 0; w < nworkers; ++w) {
-                pool.emplace_back([&] {
-                    for (int r = next.fetch_add(1); r < restarts; r = next.fetch_add(1)) runRestart(r);
-                });
-            }
-            for (auto &th: pool) th.join();
-        }
-
-        if (monitor.joinable()) {
-            monitoring.store(false, std::memory_order_relaxed);
-            monitor.join();
-        }
-        if (opt.on_progress) opt.on_progress(SolveProgress{1.0, bestAtomic.load(std::memory_order_relaxed)});
-
-        OptResult best;
-        best.sol.eval.coverage = -1;
-        for (auto &res: results) {
-            if (res.sol.eval.coverage > best.sol.eval.coverage) best = std::move(res);
-        }
-        if (best.sol.eval.coverage < 0) {
-            R.feasible = false;
-            return R;
-        }
-
-        R.feasible = best.sol.eval.feasible;
-        R.coverage = best.sol.eval.coverage;
-        R.path_length = static_cast<int>(best.sol.eval.path.size());
-        for (int c: best.sol.eval.path) R.path.emplace_back(I.cx(c) + ox, I.cy(c) + oy);
-        std::vector<std::uint8_t> onP(I.W * I.H, 0);
-        for (int pc: best.sol.eval.path) onP[pc] = 1;
-        if (I.two_cell) {
-            Tiling t = tile2cell(I, best.sol.shelf, onP);
-            auto mc = [&](int c) { return std::pair<int, int>{I.cx(c) + ox, I.cy(c) + oy}; };
-            for (const Domino &d: t.dominoes) {
-                std::array<std::pair<int, int>, 2> cells{mc(d.a), mc(d.b)};
-                R.dominoes.push_back(cells);
-                if (d.score > 0) {
-                    R.counted_shelves.push_back(cells[0]);
-                    R.counted_shelves.push_back(cells[1]);
-                }
-            }
-            for (int c: t.roadblocks) R.roadblocks.push_back(mc(c));
-        } else {
-            for (int c: I.freeCells) {
-                if (!best.sol.shelf[c]) continue;
-                int x = I.cx(c), y = I.cy(c);
-                if (shelfBest(I, onP, x, y).faces > 0) R.counted_shelves.emplace_back(x + ox, y + oy);
-            }
-        }
-        R.render = renderSolution(I, best.sol, ox, oy);
-        return R;
+        return solveMapModel(*mm, level, opt);
     }
 
     SolveResult solveMap(int map_index, int level, const SolveOptions &opt) {
-        std::string path = opt.maps_dir + "/m" + std::to_string(map_index) + ".json";
+        if (opt.maps_dir == "Scene") {
+            const std::string_view embedded = embeddedMapJson(map_index);
+            if (!embedded.empty()) return solveMapJson(embedded, level, opt);
+        }
+
+        std::string path = mapFilePath(opt.maps_dir, map_index);
         return solveMapFile(path, level, opt);
     }
 }

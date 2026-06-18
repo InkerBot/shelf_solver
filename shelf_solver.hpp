@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -57,5 +58,8 @@ namespace shelf {
     SolveResult solveMap(int map_index, int level, const SolveOptions &opt = {});
 
     SolveResult solveMapFile(const std::string &map_path, int level,
+                             const SolveOptions &opt = {});
+
+    SolveResult solveMapJson(std::string_view map_json, int level,
                              const SolveOptions &opt = {});
 }

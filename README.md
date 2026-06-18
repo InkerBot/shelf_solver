@@ -1,5 +1,17 @@
 # Shelf Solver — 最大货架可见面优化
 
+## 快速使用
+
+```bash
+shelf_solver 3 3 n8 solution.svg
+```
+
+命令格式：
+
+```text
+shelf_solver <map_index> <level> [n1|n2|n4|n8] [2cell|2] [output.svg]
+```
+
 ## 问题描述
 
 ### 非形式化描述
